@@ -12,6 +12,7 @@ Usage:
 
 import sqlite3
 import os
+import argparse
 from tabulate import tabulate
 from datetime import datetime
 
@@ -456,13 +457,21 @@ def show_race_schedule(conn):
 
         print(f"\n  R{r['round']:02}  {date_str}  {r['name']} | {r['country']}  [{status}]")
 
-        if status == "Done":
-            podium_lines = get_podium(conn, r["race_id"])
-            if podium_lines:
-                for line in podium_lines:
-                    print(f"       {line}")
-            else:
-                print("       No result data yet.")
+        # Show predicted vs. actual podium side by side. A prediction only
+        # exists once it's been locked in on race morning (see
+        # predict_next_race) — an "Upcoming" race with no prediction yet
+        # simply shows nothing here.
+        predicted_lines = get_predicted_podium(conn, r["race_id"])
+        actual_lines    = get_podium(conn, r["race_id"]) if status == "Done" else []
+
+        if predicted_lines or actual_lines:
+            print(f"       {'PREDICTED':<32}{'ACTUAL'}")
+            for i in range(3):
+                pred = predicted_lines[i] if i < len(predicted_lines) else ""
+                act  = actual_lines[i]    if i < len(actual_lines)    else ""
+                print(f"       {pred:<32}{act}")
+        elif status == "Done":
+            print("       No result data yet.")
 
     print()
 
@@ -524,14 +533,67 @@ def get_wet_score(conn, driver_id):
     return round(wet_score, 3), total, wins, podiums
 
 
-def predict_next_race(conn):
+def get_locked_prediction(conn, race_id):
     """
-    Predict podium and constructor outlook for the next race.
+    Return the locked-in predicted top-10 for a race, or [] if none exists.
+
+    LEARNING NOTE: We store team_id at prediction time rather than joining
+    to the driver's *current* team_id later — a driver can switch teams
+    before we look this back up, and we want the prediction to reflect the
+    team they were on when the prediction was made.
+    """
+    rows = conn.execute("""
+        SELECT p.predicted_rank, p.predicted_score,
+               d.forename || ' ' || d.surname AS driver, d.surname,
+               t.name AS team
+        FROM   predictions p
+        JOIN   drivers d ON p.driver_id = d.driver_id
+        JOIN   teams   t ON p.team_id   = t.team_id
+        WHERE  p.race_id = ?
+        ORDER  BY p.predicted_rank
+    """, (race_id,)).fetchall()
+    return rows
+
+
+def save_prediction(conn, race_id, scores):
+    """
+    Lock in the top-10 predicted order for a race. Safe to call more than
+    once — INSERT OR IGNORE means only the first lock-in for a given race
+    sticks, so the prediction can't drift after the fact.
+    """
+    cursor = conn.cursor()
+    for rank, s in enumerate(scores[:10], start=1):
+        cursor.execute("""
+            INSERT OR IGNORE INTO predictions
+                (race_id, driver_id, team_id, predicted_rank, predicted_score)
+            VALUES (?, ?, ?, ?, ?)
+        """, (race_id, s["driver_id"], s["team_id"], rank, s["score"]))
+    conn.commit()
+
+
+def get_predicted_podium(conn, race_id):
+    """Return the locked-in predicted top 3 for a race as display strings."""
+    rows = [r for r in get_locked_prediction(conn, race_id) if r["predicted_rank"] <= 3]
+    if not rows:
+        return []
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    return [
+        f"{medals[r['predicted_rank']]} {r['surname']:<18} {r['team']}"
+        for r in rows
+    ]
+
+
+WET_BOOST_MAX = 0.40
+
+
+def compute_prediction_scores(conn, circuit, rain_forecast):
+    """
+    Score every active current-grid driver for an upcoming race.
 
     Base score = weighted average of 3 form components:
-      Last 3 races              50%
-      Same circuit last year    30%
-      Last season standing      20%
+      Last 5 races this season   65%
+      Same circuit last year     25%
+      Last season standing       10%
 
     Weather boost (when rain forecast):
       final = base x (1 + wet_score x WET_BOOST_MAX)
@@ -540,58 +602,9 @@ def predict_next_race(conn):
     LEARNING NOTE: Multiplying by (1 + boost) keeps the adjustment
     proportional to base score. A strong driver gets a larger absolute
     boost, which reflects reality — pace advantage compounds in the wet.
+
+    Returns scores sorted best-first, or None if there are no active drivers.
     """
-
-    WET_BOOST_MAX = 0.40
-    today         = datetime.now().date()
-
-    # ── Next race ─────────────────────────────────────────────────────────────
-    next_race = conn.execute("""
-        SELECT race_id, round, name, circuit, country, race_date
-        FROM   races
-        WHERE  year      = ?
-          AND  race_date >= ?
-        ORDER  BY round
-        LIMIT  1
-    """, (CURRENT_YEAR, today.isoformat())).fetchone()
-
-    if not next_race:
-        print("\n  No upcoming races found for this season.")
-        return
-
-    race_id   = next_race["race_id"]
-    circuit   = next_race["circuit"]
-    race_date = next_race["race_date"]
-    days_away = (datetime.strptime(race_date, "%Y-%m-%d").date() - today).days
-
-    # ── Forecast weather ──────────────────────────────────────────────────────
-    forecast = conn.execute("""
-        SELECT temp_air, humidity, wind_speed, rainfall, precipitation_mm
-        FROM   race_weather
-        WHERE  race_id = ?
-    """, (race_id,)).fetchone()
-
-    rain_forecast = forecast["rainfall"] == 1 if forecast else False
-
-    # ── Header ────────────────────────────────────────────────────────────────
-    sep = chr(9552) * 62
-    print(f"\n{sep}")
-    print(f"  NEXT RACE PREDICTION")
-    print(f"  {next_race['name']} — {next_race['country']}")
-    print(f"  {circuit}")
-    print(f"  {race_date}  ({days_away} days away)")
-
-    if forecast:
-        cond = "🌧  WET RACE FORECAST" if rain_forecast else "☀  DRY RACE FORECAST"
-        print(f"  {cond}  |  Temp: {forecast['temp_air']}°C  "
-              f"Humidity: {forecast['humidity']}%  "
-              f"Wind: {forecast['wind_speed']} km/h  "
-              f"Rain: {forecast['precipitation_mm']}mm")
-        if rain_forecast:
-            print(f"  💧 Wet boost active — up to +{int(WET_BOOST_MAX*100)}% for top wet drivers")
-    else:
-        print(f"  ⚠  No forecast — run: python fetch_weather.py --forecast-only")
-    print(f"{sep}")
 
     # ── Active drivers ────────────────────────────────────────────────────────
     drivers = conn.execute("""
@@ -605,8 +618,7 @@ def predict_next_race(conn):
     """.format(",".join("?" * len(CURRENT_TEAMS))), CURRENT_TEAMS).fetchall()
 
     if not drivers:
-        print("\n  No active drivers found. Run repair_drivers.py first.")
-        return
+        return None
 
     scores = []
     for d in drivers:
@@ -694,6 +706,8 @@ def predict_next_race(conn):
         final_score = base_score * (1 + boost)
 
         scores.append({
+            "driver_id":   driver_id,
+            "team_id":     d["team_id"],
             "driver":      d["name"],
             "surname":     d["surname"],
             "team":        d["team"],
@@ -712,6 +726,11 @@ def predict_next_race(conn):
         })
 
     scores.sort(key=lambda x: x["score"], reverse=True)
+    return scores
+
+
+def print_prediction_tables(scores, rain_forecast):
+    """Print the driver podium prediction and constructor outlook tables."""
     medals      = {1: "🥇", 2: "🥈", 3: "🥉"}
     team_medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     dash        = chr(9472)
@@ -762,6 +781,144 @@ def predict_next_race(conn):
         print(f"  Wet boost: base x (1 + wet_score x {WET_BOOST_MAX}) | max +{int(WET_BOOST_MAX*100)}%")
     print(f"  ⚠  Form model — excludes strategy, mechanical failures, luck.\n")
 
+
+def predict_next_race(conn):
+    """
+    Show a prediction for the next race — callable any time.
+
+    Before race day this is a live, unofficial preview (recalculated from
+    current form every time you ask). Once locked in on race morning by
+    auto_lock_prediction(), it shows that locked, official prediction
+    instead — same one that'll be compared to results after the race.
+    """
+
+    today = datetime.now().date()
+
+    next_race = conn.execute("""
+        SELECT race_id, round, name, circuit, country, race_date
+        FROM   races
+        WHERE  year      = ?
+          AND  race_date >= ?
+        ORDER  BY round
+        LIMIT  1
+    """, (CURRENT_YEAR, today.isoformat())).fetchone()
+
+    if not next_race:
+        print("\n  No upcoming races found for this season.")
+        return
+
+    race_id   = next_race["race_id"]
+    circuit   = next_race["circuit"]
+    race_date = next_race["race_date"]
+    days_away = (datetime.strptime(race_date, "%Y-%m-%d").date() - today).days
+
+    # ── Already locked in for race morning? ───────────────────────────────────
+    existing = get_locked_prediction(conn, race_id)
+    if existing:
+        sep = chr(9552) * 62
+        print(f"\n{sep}")
+        print(f"  {next_race['name']} — OFFICIAL PREDICTION (locked in race morning)")
+        print(f"{sep}")
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        dash   = chr(9472)
+        print(f"\n  {'':4} {'Driver':<22} {'Team':<20} {'Score':>6}")
+        print(f"  {dash * 56}")
+        for r in existing:
+            medal = medals.get(r["predicted_rank"], f"   {r['predicted_rank']}.")
+            print(f"  {medal}  {r['driver']:<22} {r['team']:<20} {r['predicted_score']:>6.2f}")
+        print(f"\n  This prediction is locked — check the race schedule after the")
+        print(f"  race for predicted vs. actual.\n")
+        return
+
+    # ── Forecast weather ──────────────────────────────────────────────────────
+    forecast = conn.execute("""
+        SELECT temp_air, humidity, wind_speed, rainfall, precipitation_mm
+        FROM   race_weather
+        WHERE  race_id = ?
+    """, (race_id,)).fetchone()
+
+    rain_forecast = forecast["rainfall"] == 1 if forecast else False
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    sep = chr(9552) * 62
+    print(f"\n{sep}")
+    print(f"  NEXT RACE PREDICTION — LIVE PREVIEW (unofficial)")
+    print(f"  {next_race['name']} — {next_race['country']}")
+    print(f"  {circuit}")
+    print(f"  {race_date}  ({days_away} days away)")
+
+    if forecast:
+        cond = "🌧  WET RACE FORECAST" if rain_forecast else "☀  DRY RACE FORECAST"
+        print(f"  {cond}  |  Temp: {forecast['temp_air']}°C  "
+              f"Humidity: {forecast['humidity']}%  "
+              f"Wind: {forecast['wind_speed']} km/h  "
+              f"Rain: {forecast['precipitation_mm']}mm")
+        if rain_forecast:
+            print(f"  💧 Wet boost active — up to +{int(WET_BOOST_MAX*100)}% for top wet drivers")
+    else:
+        print(f"  ⚠  No forecast — run: python fetch_weather.py --forecast-only")
+    print(f"{sep}")
+    print(f"  ⚠  Preview only — the official prediction locks in automatically on")
+    print(f"     race morning ({race_date}), once the weather forecast is most accurate.")
+
+    scores = compute_prediction_scores(conn, circuit, rain_forecast)
+    if scores is None:
+        print("\n  No active drivers found. Run repair_drivers.py first.")
+        return
+
+    print_prediction_tables(scores, rain_forecast)
+
+
+def auto_lock_prediction(conn):
+    """
+    Non-interactive: lock in today's prediction if (and only if) the next
+    upcoming race is happening today. Intended to be run once via a cron
+    job scheduled for race morning, before lights out — see
+    `python explore.py --lock-next-race`.
+
+    Safe to run more than once: save_prediction() uses INSERT OR IGNORE,
+    so if today's prediction is already locked in, this is a no-op.
+    """
+
+    today = datetime.now().date()
+
+    next_race = conn.execute("""
+        SELECT race_id, round, name, circuit, country, race_date
+        FROM   races
+        WHERE  year      = ?
+          AND  race_date >= ?
+        ORDER  BY round
+        LIMIT  1
+    """, (CURRENT_YEAR, today.isoformat())).fetchone()
+
+    if not next_race:
+        print("No upcoming races found for this season — nothing to lock.")
+        return
+
+    race_id   = next_race["race_id"]
+    race_date = next_race["race_date"]
+
+    if race_date != today.isoformat():
+        print(f"Next race ({next_race['name']}) is on {race_date}, not today — skipping.")
+        return
+
+    if get_locked_prediction(conn, race_id):
+        print(f"Prediction for {next_race['name']} is already locked in — skipping.")
+        return
+
+    forecast = conn.execute("""
+        SELECT rainfall FROM race_weather WHERE race_id = ?
+    """, (race_id,)).fetchone()
+    rain_forecast = forecast["rainfall"] == 1 if forecast else False
+
+    scores = compute_prediction_scores(conn, next_race["circuit"], rain_forecast)
+    if scores is None:
+        print("No active drivers found — run repair_drivers.py first. Nothing locked.")
+        return
+
+    save_prediction(conn, race_id, scores)
+    top3 = ", ".join(s["driver"] for s in scores[:3])
+    print(f"Locked in prediction for {next_race['name']} ({race_date}). Top 3: {top3}")
 
 
 def print_menu():
@@ -817,4 +974,21 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="F1 Research Tool")
+    parser.add_argument(
+        "--lock-next-race",
+        action="store_true",
+        help=("Non-interactive: lock in today's prediction if the next race "
+              "is today. Intended for a cron job scheduled for race morning.")
+    )
+    args = parser.parse_args()
+
+    if args.lock_next_race:
+        if not os.path.exists(DB_PATH):
+            print("ERROR: Database not found. Run db_setup.py and fetch_data.py first.")
+        else:
+            conn = get_connection()
+            auto_lock_prediction(conn)
+            conn.close()
+    else:
+        main()

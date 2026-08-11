@@ -171,6 +171,27 @@ def create_tables(conn):
     """)
     print("  ✓ race_weather table ready")
 
+    # ── Predictions ───────────────────────────────────────────────────────────
+    # One row per driver per race — the predicted finishing order, locked in
+    # on race morning (when the weather forecast is most accurate) and never
+    # overwritten afterward. Compare against 'results' once the race is done.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS predictions (
+            prediction_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            race_id          INTEGER NOT NULL,
+            driver_id        INTEGER NOT NULL,
+            team_id          INTEGER NOT NULL,
+            predicted_rank   INTEGER NOT NULL,
+            predicted_score  REAL,
+            created_at       TEXT    DEFAULT (datetime('now')),
+            FOREIGN KEY (race_id)   REFERENCES races(race_id),
+            FOREIGN KEY (driver_id) REFERENCES drivers(driver_id),
+            FOREIGN KEY (team_id)   REFERENCES teams(team_id),
+            UNIQUE (race_id, driver_id)
+        )
+    """)
+    print("  ✓ predictions table ready")
+
     # Commit saves all the CREATE TABLE statements to the database file
     # LEARNING NOTE: SQLite uses transactions — changes aren't written
     # to disk until you call commit(). If something crashes before commit,
