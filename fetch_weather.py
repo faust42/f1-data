@@ -24,12 +24,16 @@ import time
 import os
 import json
 import argparse
+import difflib
 from datetime import datetime, timedelta
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-DB_PATH   = "/root/f1-data/f1_data.db"
-CACHE_DIR = "/root/f1-data/cache"
+# Resolved relative to this script's location so it works whether you're
+# running on the VS Code server or locally (Windows/macOS/Linux).
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+DB_PATH   = os.path.join(BASE_DIR, "f1_data.db")
+CACHE_DIR = os.path.join(BASE_DIR, "cache")
 
 OPENF1_BASE   = "https://api.openf1.org/v1"
 OPENMETEO_BASE = "https://api.open-meteo.com/v1"
@@ -87,6 +91,25 @@ CIRCUIT_COORDS = {
     "Portimao":                              (37.2272,   -8.6268),
     "Autodromo Internacional do Algarve":    (37.2272,   -8.6268),
 }
+
+
+def match_circuit_coords(circuit_name):
+    """
+    Look up lat/lon for a circuit name, falling back to fuzzy matching
+    when the name doesn't match CIRCUIT_COORDS exactly.
+
+    LEARNING NOTE: The old fallback did a substring check on the first
+    two words of the circuit name (e.g. "de" in "Autodromo Internazionale
+    del Mugello"). Short common words match many unrelated keys, so it
+    could silently pick the wrong circuit's coordinates. difflib's
+    get_close_matches scores overall string similarity instead, which is
+    far less likely to false-positive on an unrelated circuit.
+    """
+    if circuit_name in CIRCUIT_COORDS:
+        return CIRCUIT_COORDS[circuit_name]
+
+    close = difflib.get_close_matches(circuit_name, CIRCUIT_COORDS.keys(), n=1, cutoff=0.6)
+    return CIRCUIT_COORDS[close[0]] if close else None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -201,24 +224,29 @@ def fetch_openf1_weather(conn):
             source=f"OpenF1/sessions/{race['year']}/R{race['round']}"
         )
 
-        # Match by finding the session closest to the race date
+        # Match by finding the session closest to the race date.
+        # LEARNING NOTE: The old fallback (when no session fell within 1 day)
+        # picked the season's earliest session by sort order — silently
+        # attaching the wrong race's weather. Instead we scan every session
+        # once and keep whichever has the smallest date difference.
         session_key = None
         if sessions and isinstance(sessions, list):
-            race_dt = datetime.strptime(race["race_date"], "%Y-%m-%d")
+            race_dt      = datetime.strptime(race["race_date"], "%Y-%m-%d")
+            best_session = None
+            best_diff    = None
             for s in sessions:
                 s_date = s.get("date_start", "")[:10]
-                if s_date == race["race_date"] or (
-                    s_date and abs((datetime.strptime(s_date, "%Y-%m-%d") - race_dt).days) <= 1
-                ):
-                    session_key = s.get("session_key")
-                    break
-            # Fallback: just use the first race session of that year round
-            if not session_key and sessions:
-                # Sort by date and pick closest to race date
-                for s in sorted(sessions, key=lambda x: x.get("date_start", "")):
-                    if str(race["year"]) in s.get("date_start", ""):
-                        session_key = s.get("session_key")
-                        break
+                if not s_date:
+                    continue
+                try:
+                    diff = abs((datetime.strptime(s_date, "%Y-%m-%d") - race_dt).days)
+                except ValueError:
+                    continue
+                if best_diff is None or diff < best_diff:
+                    best_diff    = diff
+                    best_session = s
+            if best_session is not None:
+                session_key = best_session.get("session_key")
 
         if not session_key:
             skipped += 1
@@ -319,14 +347,8 @@ def fetch_openmeteo_historical(conn):
     for i, race in enumerate(races, start=1):
         progress(i, total, label=f"{race['year']} R{race['round']:02} {race['name'][:25]}")
 
-        # Look up coordinates for this circuit
-        coords = CIRCUIT_COORDS.get(race["circuit"])
-        if not coords:
-            # Try partial match — some circuit names vary slightly year to year
-            for key, val in CIRCUIT_COORDS.items():
-                if any(word in key for word in race["circuit"].split()[:2]):
-                    coords = val
-                    break
+        # Look up coordinates for this circuit (exact, then fuzzy match)
+        coords = match_circuit_coords(race["circuit"])
 
         if not coords:
             skipped += 1
@@ -452,12 +474,7 @@ def fetch_next_race_forecast(conn):
 
     print(f"  Next race: {next_race['name']} on {next_race['race_date']}")
 
-    coords = CIRCUIT_COORDS.get(next_race["circuit"])
-    if not coords:
-        for key, val in CIRCUIT_COORDS.items():
-            if any(word in key for word in next_race["circuit"].split()[:2]):
-                coords = val
-                break
+    coords = match_circuit_coords(next_race["circuit"])
 
     if not coords:
         print(f"  No coordinates found for '{next_race['circuit']}' — skipping forecast.")

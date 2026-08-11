@@ -26,8 +26,11 @@ from datetime import datetime
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-DB_PATH    = "/root/f1-data/f1_data.db"
-CACHE_DIR  = "/root/f1-data/cache"
+# Resolved relative to this script's location so it works whether you're
+# running on the VS Code server or locally (Windows/macOS/Linux).
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+DB_PATH    = os.path.join(BASE_DIR, "f1_data.db")
+CACHE_DIR  = os.path.join(BASE_DIR, "cache")
 
 START_YEAR = 2015
 # LEARNING NOTE: datetime.now().year always returns the current calendar year.
@@ -136,6 +139,26 @@ def progress(current, total, label=""):
 
 # ── Ergast / Jolpica Fetchers ──────────────────────────────────────────────────
 
+def extract(data, keys, source):
+    """
+    Safely walk a nested dict by a list of keys, e.g. extract(data,
+    ["MRData", "ConstructorTable", "Constructors"], "Jolpica/teams").
+
+    LEARNING NOTE: The Jolpica/Ergast API can return a 200 OK with an
+    unexpected JSON shape (rate-limit soft-errors, maintenance pages).
+    Without this check, a plain data["MRData"]["X"]["Y"] would raise an
+    uncaught KeyError and crash the whole run mid-loop. Returning None
+    instead lets the caller treat it like "no data" and move on.
+    """
+    node = data
+    for key in keys:
+        if not isinstance(node, dict) or key not in node:
+            print(f"\n    [{source}] Unexpected response shape (missing '{key}') — skipping.")
+            return None
+        node = node[key]
+    return node
+
+
 def fetch_teams(conn):
     """
     Fetch all F1 constructors and insert into the teams table.
@@ -155,7 +178,7 @@ def fetch_teams(conn):
         if not data:
             break
 
-        constructors = data["MRData"]["ConstructorTable"]["Constructors"]
+        constructors = extract(data, ["MRData", "ConstructorTable", "Constructors"], "Jolpica/teams")
         if not constructors:
             break
 
@@ -201,7 +224,7 @@ def fetch_drivers(conn):
         if not data:
             break
 
-        drivers = data["MRData"]["DriverTable"]["Drivers"]
+        drivers = extract(data, ["MRData", "DriverTable", "Drivers"], "Jolpica/drivers")
         if not drivers:
             break
 
@@ -241,8 +264,12 @@ def fetch_races(conn, year):
     if not data:
         return 0
 
+    races_data = extract(data, ["MRData", "RaceTable", "Races"], f"Jolpica/races/{year}")
+    if races_data is None:
+        return 0
+
     added = 0
-    for r in data["MRData"]["RaceTable"]["Races"]:
+    for r in races_data:
         try:
             cursor.execute("""
                 INSERT OR IGNORE INTO races
@@ -284,7 +311,7 @@ def fetch_results(conn, year):
         if not data:
             break
 
-        races = data["MRData"]["RaceTable"]["Races"]
+        races = extract(data, ["MRData", "RaceTable", "Races"], f"Jolpica/results/{year}")
         if not races:
             break
 
@@ -353,7 +380,7 @@ def fetch_standings(conn, year):
     if not data:
         return 0
 
-    standings_lists = data["MRData"]["StandingsTable"]["StandingsLists"]
+    standings_lists = extract(data, ["MRData", "StandingsTable", "StandingsLists"], f"Jolpica/standings/{year}")
     if not standings_lists:
         return 0
 
@@ -450,15 +477,21 @@ def fetch_openf1_supplement(conn):
             print(f"\n    No OpenF1 driver data for {year} (session {session_key}), skipping.")
             continue
 
-        # Step 3: Mark each driver as active in our DB by driver number
+        # Step 3: Mark each driver as active in our DB by driver number + surname.
+        # LEARNING NOTE: Driver numbers get reused across F1 history (e.g. #1,
+        # #33, #44 have all belonged to multiple different drivers over the
+        # decades). Matching on number alone can silently mark a retired
+        # driver active. Requiring the surname to match too makes a false
+        # match effectively impossible.
         for driver in drivers_data:
-            number = driver.get("driver_number")
-            if not number:
+            number  = driver.get("driver_number")
+            surname = driver.get("last_name")
+            if not number or not surname:
                 continue
             try:
                 cursor.execute(
-                    "UPDATE drivers SET active = 1 WHERE driver_number = ?",
-                    (number,)
+                    "UPDATE drivers SET active = 1 WHERE driver_number = ? AND surname = ? COLLATE NOCASE",
+                    (number, surname)
                 )
                 if cursor.rowcount > 0:
                     updated += 1

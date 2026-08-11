@@ -14,9 +14,13 @@ Usage:
 """
 
 import sqlite3
+import os
 from datetime import datetime
 
-DB_PATH = "/root/f1-data/f1_data.db"
+# Resolved relative to this script's location so it works whether you're
+# running on the VS Code server or locally (Windows/macOS/Linux).
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH  = os.path.join(BASE_DIR, "f1_data.db")
 
 
 def main():

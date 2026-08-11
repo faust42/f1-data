@@ -8,8 +8,9 @@ __pycache__/
 *credentials*.json
 *token*.json
 
-# All docs
+# All docs (except the public README)
 *.md
+!README.md
 
 # Database
 f1_data.db

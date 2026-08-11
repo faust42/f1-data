@@ -17,7 +17,10 @@ from datetime import datetime
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-DB_PATH      = "/root/f1-data/f1_data.db"
+# Resolved relative to this script's location so it works whether you're
+# running on the VS Code server or locally (Windows/macOS/Linux).
+BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
+DB_PATH      = os.path.join(BASE_DIR, "f1_data.db")
 
 # Current year — used throughout so the script stays accurate automatically
 CURRENT_YEAR = datetime.now().year
@@ -115,9 +118,10 @@ def get_team_profile(conn, constructor_id):
             MIN(s.final_position) AS best_position
         FROM seasons s
         WHERE s.team_id = ?
+          AND s.year BETWEEN ? AND ?
         GROUP BY s.year
         ORDER BY s.year
-    """, (team_id,)).fetchall()
+    """, (team_id, CURRENT_YEAR - 10, CURRENT_YEAR)).fetchall()
 
     if history:
         print(f"\n  10-Year Season History")
@@ -209,7 +213,8 @@ def get_team_profile(conn, constructor_id):
         JOIN races r ON res.race_id = r.race_id
         WHERE res.team_id    = ?
           AND res.fastest_lap = 1
-    """, (team_id,)).fetchone()["total"]
+          AND r.year BETWEEN ? AND ?
+    """, (team_id, CURRENT_YEAR - 10, CURRENT_YEAR)).fetchone()["total"]
 
     # ── Championships (wins in seasons table where final_position = 1) ────────
     # LEARNING NOTE: The Ergast data doesn't have a separate championships
@@ -221,8 +226,9 @@ def get_team_profile(conn, constructor_id):
         FROM seasons
         WHERE team_id      = ?
           AND final_position = 1
+          AND year BETWEEN ? AND ?
         ORDER BY year
-    """, (team_id,)).fetchall()
+    """, (team_id, CURRENT_YEAR - 10, CURRENT_YEAR)).fetchall()
 
     print(f"\n  Quick Stats ({CURRENT_YEAR - 10}–{CURRENT_YEAR})")
     print(f"  {'─' * 45}")
