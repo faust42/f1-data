@@ -1,0 +1,27 @@
+# Python environment
+venv/
+__pycache__/
+*.pyc
+
+# Secrets — no obvious ones in this project yet, but excluded by default
+.env
+*credentials*.json
+*token*.json
+
+# All docs
+*.md
+
+# Database
+f1_data.db
+*.db-journal
+
+# API response cache — 300+ files, fully regenerable via fetch_data.py/fetch_weather.py
+cache/
+
+# Logs
+refresh.log
+
+# OS/editor
+.DS_Store
+.vscode/
+*.swp
