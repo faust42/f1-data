@@ -192,6 +192,27 @@ def create_tables(conn):
     """)
     print("  ✓ predictions table ready")
 
+    # ── Model Weights ─────────────────────────────────────────────────────────
+    # Single-row table (id is always 1) holding the learned prediction
+    # weights. train_model.py fits these from historical race results;
+    # compute_prediction_scores() in explore.py reads them at prediction
+    # time and falls back to reasonable hand-picked defaults if this table
+    # is still empty (i.e. before the first training run).
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS model_weights (
+            id             INTEGER PRIMARY KEY CHECK (id = 1),
+            intercept      REAL NOT NULL,
+            w_last5        REAL NOT NULL,
+            w_circuit      REAL NOT NULL,
+            w_season       REAL NOT NULL,
+            w_team         REAL NOT NULL,
+            wet_boost_k    REAL NOT NULL,
+            races_trained  INTEGER NOT NULL,
+            trained_at     TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    print("  ✓ model_weights table ready")
+
     # Commit saves all the CREATE TABLE statements to the database file
     # LEARNING NOTE: SQLite uses transactions — changes aren't written
     # to disk until you call commit(). If something crashes before commit,

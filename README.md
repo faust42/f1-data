@@ -23,6 +23,7 @@ All API calls are cached to disk (`cache/`) so re-running a script doesn't re-hi
 | `fetch_weather.py` | Fetches race weather (historical + forecast). Supports `--forecast-only`. |
 | `repair_drivers.py` | One-time repair pass: resets driver `active` flags and re-derives them from the most recent season each driver appears in. |
 | `explore.py` | Interactive menu for browsing the data — team profiles, comparisons, race schedule, and a "next race" predictor. Supports `--lock-next-race` to lock in that prediction non-interactively (for cron). |
+| `train_model.py` | Fits the prediction model's weights from historical results (see [Prediction model](#prediction-model) below). Runs automatically at the end of `fetch_data.py`; can also be run standalone. |
 
 ## Setup
 
@@ -71,6 +72,29 @@ Once locked, `predict_next_race` and the race schedule (menu option 4) show
 that same official prediction alongside the actual result once the race is
 run.
 
+## Prediction model
+
+`predict_next_race` scores each active driver from 4 form components — recent
+races, same-circuit history, last season's standing, and the driver's team's
+recent form (car/pace strength independent of that driver specifically) —
+plus a wet-weather boost when rain is forecast.
+
+The weights combining those components aren't hand-picked guesses anymore.
+`train_model.py` rebuilds, for every historical race, exactly the features
+the model would have seen *before* that race happened (no lookahead), then
+fits a linear regression against what actually happened. The fitted weights
+are saved to the `model_weights` table and read by `explore.py` at prediction
+time — falling back to reasonable defaults only if there isn't yet enough
+history to train on (fewer than 50 results).
+
+This retrains automatically at the end of every `fetch_data.py` run (full or
+`--refresh-current`), so the model keeps learning as each new race adds data.
+You can also trigger it manually:
+
+```bash
+python train_model.py
+```
+
 ## Automation (cron)
 
 None of these scripts need to run as a long-lived service — they're short
@@ -101,6 +125,7 @@ SQLite database (`f1_data.db`, gitignored — regenerate it with the scripts abo
 - **results** — one row per driver per race (the most granular table)
 - **race_weather** — one row per race (averaged conditions, source-tagged `openf1` / `open-meteo` / `open-meteo-forecast`)
 - **predictions** — one row per driver per race, locked in on race morning (see [Predictions](#predictions-preview-vs-locked-in) above); never overwritten once saved
+- **model_weights** — single row holding the learned prediction weights (see [Prediction model](#prediction-model) above); replaced each time `train_model.py` runs
 
 ## Notes
 

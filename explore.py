@@ -497,17 +497,29 @@ def position_to_points(position):
     return F1_POINTS.get(int(position), 0)
 
 
+# Wet-score shrinkage — a driver with 1 wet race and a win gets a raw
+# wet_score of 0.6, same as a driver with 20 wet races at a 60% win rate —
+# pure noise on a tiny sample. We shrink toward a league-average prior by
+# blending in WET_PRIOR_N "imaginary" average races, so small samples pull
+# toward the baseline instead of swinging to an extreme.
+WET_PRIOR_N     = 8
+WET_PRIOR_SCORE = 0.10
+
+
 def get_wet_score(conn, driver_id):
     """
     Calculate a driver's wet race performance score.
 
     We define a wet race as any race where race_weather.rainfall = 1.
-    Wet score = (win_rate x 0.6) + (podium_rate x 0.4)
+    Raw wet score = (win_rate x 0.6) + (podium_rate x 0.4), then shrunk
+    toward WET_PRIOR_SCORE using WET_PRIOR_N imaginary average races —
+    see the LEARNING NOTE above WET_PRIOR_N.
 
     LEARNING NOTE: Rates (0.0-1.0) are better than raw counts here
     because drivers race different numbers of wet races in their careers.
     A driver with 3 wins from 5 wet races (0.60) is more impressive
-    than one with 5 wins from 30 wet races (0.17).
+    than one with 5 wins from 30 wet races (0.17) — but shrinkage still
+    tempers that 0.60 if it's only from 5 races.
     """
     row = conn.execute("""
         SELECT
@@ -525,12 +537,13 @@ def get_wet_score(conn, driver_id):
     podiums = row["podiums"] or 0
 
     if total == 0:
-        return 0.0, 0, 0, 0
+        return WET_PRIOR_SCORE, 0, 0, 0
 
     win_rate    = wins    / total
     podium_rate = podiums / total
-    wet_score   = (win_rate * 0.6) + (podium_rate * 0.4)
-    return round(wet_score, 3), total, wins, podiums
+    raw_score   = (win_rate * 0.6) + (podium_rate * 0.4)
+    shrunk      = (raw_score * total + WET_PRIOR_N * WET_PRIOR_SCORE) / (total + WET_PRIOR_N)
+    return round(shrunk, 3), total, wins, podiums
 
 
 def get_locked_prediction(conn, race_id):
@@ -583,21 +596,55 @@ def get_predicted_podium(conn, race_id):
     ]
 
 
-WET_BOOST_MAX = 0.40
+# Fallback weights, used only until train_model.py has fit real ones from
+# history (model_weights table has < 50 training rows). These are the
+# original hand-picked guesses.
+DEFAULT_WEIGHTS = {
+    "intercept": 0.0, "w_last5": 0.65, "w_circuit": 0.25,
+    "w_season": 0.10, "w_team": 0.0, "wet_boost_k": 0.40,
+}
+
+# Recency weights for the "last 5 races" component, most recent race
+# first. A simple average treats race 1 and race 5 identically even
+# though F1 cars change meaningfully mid-season (upgrades); weighting the
+# most recent race heaviest reflects that current form matters more.
+RECENCY_WEIGHTS = [5, 4, 3, 2, 1]
+
+
+def get_model_weights(conn):
+    """Load the learned model weights, or DEFAULT_WEIGHTS if not trained yet."""
+    row = conn.execute("SELECT * FROM model_weights WHERE id = 1").fetchone()
+    if not row:
+        return dict(DEFAULT_WEIGHTS, learned=False, races_trained=0, trained_at=None)
+    return {
+        "intercept":     row["intercept"],
+        "w_last5":       row["w_last5"],
+        "w_circuit":     row["w_circuit"],
+        "w_season":      row["w_season"],
+        "w_team":        row["w_team"],
+        "wet_boost_k":   row["wet_boost_k"],
+        "learned":       True,
+        "races_trained": row["races_trained"],
+        "trained_at":    row["trained_at"],
+    }
 
 
 def compute_prediction_scores(conn, circuit, rain_forecast):
     """
     Score every active current-grid driver for an upcoming race.
 
-    Base score = weighted average of 3 form components:
-      Last 5 races this season   65%
-      Same circuit last year     25%
-      Last season standing       10%
+    base_score = intercept
+               + w_last5   * last5_pts    (recency-weighted last 5 races)
+               + w_circuit * circuit_pts  (same circuit, last 3 years)
+               + w_season  * season_pts   (last season's final standing)
+               + w_team    * team_pts     (team's recent form, both cars)
+
+    Weights come from get_model_weights() — learned from historical
+    results by train_model.py once enough data exists, DEFAULT_WEIGHTS
+    (the original hand-picked guesses) otherwise.
 
     Weather boost (when rain forecast):
-      final = base x (1 + wet_score x WET_BOOST_MAX)
-      WET_BOOST_MAX = 0.40  -> elite wet driver gets up to +40%
+      final = base x (1 + wet_score x wet_boost_k)
 
     LEARNING NOTE: Multiplying by (1 + boost) keeps the adjustment
     proportional to base score. A strong driver gets a larger absolute
@@ -605,6 +652,8 @@ def compute_prediction_scores(conn, circuit, rain_forecast):
 
     Returns scores sorted best-first, or None if there are no active drivers.
     """
+
+    weights = get_model_weights(conn)
 
     # ── Active drivers ────────────────────────────────────────────────────────
     drivers = conn.execute("""
@@ -624,10 +673,9 @@ def compute_prediction_scores(conn, circuit, rain_forecast):
     for d in drivers:
         driver_id = d["driver_id"]
 
-        # Component 1: last 5 races this season (65%)
-        # LEARNING NOTE: We expanded from 3 to 5 races to capture more
-        # current-season form. Early in the season (fewer than 5 races done)
-        # it uses whatever results exist — the average still works correctly.
+        # Component 1: last 5 races this season, recency-weighted.
+        # Early in the season (fewer than 5 races done) it uses whatever
+        # results exist — the weighted average still works correctly.
         last5 = conn.execute("""
             SELECT res.finish_position
             FROM   results res
@@ -635,10 +683,14 @@ def compute_prediction_scores(conn, circuit, rain_forecast):
             WHERE  res.driver_id = ? AND r.year = ?
             ORDER  BY r.race_date DESC LIMIT 5
         """, (driver_id, CURRENT_YEAR)).fetchall()
-        last5_pts = (
-            sum(position_to_points(r["finish_position"]) for r in last5) / len(last5)
-            if last5 else 0
-        )
+        if last5:
+            total_w = sum(RECENCY_WEIGHTS[:len(last5)])
+            last5_pts = sum(
+                position_to_points(r["finish_position"]) * w
+                for r, w in zip(last5, RECENCY_WEIGHTS)
+            ) / total_w
+        else:
+            last5_pts = 0
 
         # ── Slump penalty ─────────────────────────────────────────────────────
         # If a driver has scored 0 points in ALL of their last 5 races,
@@ -654,7 +706,7 @@ def compute_prediction_scores(conn, circuit, rain_forecast):
         )
         slump_factor = 0.60 if all_zero else 1.0
 
-        # Component 2: same circuit — avg of last 3 appearances (25%)
+        # Component 2: same circuit — avg of last 3 appearances.
         # LEARNING NOTE: We do the position→points conversion inside the
         # inner subquery using CASE WHEN, then AVG() the results in the
         # outer query. SQLite can't call our Python position_to_points()
@@ -683,26 +735,40 @@ def compute_prediction_scores(conn, circuit, rain_forecast):
 
         circuit_pts = round(cly["avg_pts"], 2) if cly and cly["avg_pts"] is not None else 0
 
-        # Component 3: last season standing (10%)
-        # Reduced from 20% — historical pedigree is least predictive
-        # for current performance, as Norris's 2026 slump demonstrates
+        # Component 3: last season standing.
         ls = conn.execute("""
             SELECT final_position FROM seasons
             WHERE  driver_id = ? AND year = ?
         """, (driver_id, CURRENT_YEAR - 1)).fetchone()
         season_pts = position_to_points(ls["final_position"]) if ls else 0
 
-        # Base score with rebalanced weights (must sum to 1.0)
-        # 0.65 + 0.25 + 0.10 = 1.0
+        # Component 4: team form — average points per race across both
+        # cars over the team's last 5 races. Captures car/pace strength
+        # independent of this particular driver's own results, which
+        # matters most for a driver new to the team or with thin history.
+        team5 = conn.execute("""
+            SELECT AVG(pts) AS avg_pts FROM (
+                SELECT r.race_id, AVG(res.points) AS pts
+                FROM   results res
+                JOIN   races   r ON res.race_id = r.race_id
+                WHERE  res.team_id = ? AND r.year = ?
+                GROUP  BY r.race_id
+                ORDER  BY r.race_date DESC LIMIT 5
+            )
+        """, (d["team_id"], CURRENT_YEAR)).fetchone()
+        team_pts = round(team5["avg_pts"], 2) if team5 and team5["avg_pts"] is not None else 0
+
         base_score = (
-            (last5_pts   * 0.65) +
-            (circuit_pts * 0.25) +
-            (season_pts  * 0.10)
+            weights["intercept"]
+            + (last5_pts   * weights["w_last5"])
+            + (circuit_pts * weights["w_circuit"])
+            + (season_pts  * weights["w_season"])
+            + (team_pts    * weights["w_team"])
         ) * slump_factor
 
         # Wet boost
         wet_score, wet_total, wet_wins, wet_pods = get_wet_score(conn, driver_id)
-        boost       = wet_score * WET_BOOST_MAX if rain_forecast else 0.0
+        boost       = wet_score * weights["wet_boost_k"] if rain_forecast else 0.0
         final_score = base_score * (1 + boost)
 
         scores.append({
@@ -717,6 +783,7 @@ def compute_prediction_scores(conn, circuit, rain_forecast):
             "last5_pts":   round(last5_pts,    1),
             "circuit_pts": circuit_pts,
             "season_pts":  season_pts,
+            "team_pts":    team_pts,
             "slump":       all_zero,
             "wet_score":   wet_score,
             "wet_total":   wet_total,
@@ -729,8 +796,9 @@ def compute_prediction_scores(conn, circuit, rain_forecast):
     return scores
 
 
-def print_prediction_tables(scores, rain_forecast):
+def print_prediction_tables(conn, scores, rain_forecast):
     """Print the driver podium prediction and constructor outlook tables."""
+    weights     = get_model_weights(conn)
     medals      = {1: "🥇", 2: "🥈", 3: "🥉"}
     team_medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     dash        = chr(9472)
@@ -755,7 +823,8 @@ def print_prediction_tables(scores, rain_forecast):
         for i, s in enumerate(scores[:10], start=1):
             medal = medals.get(i, f"   {i}.")
             slump = " ⚠slump" if s["slump"] else ""
-            bd    = f"(L5:{s['last5_pts']:>4} | Cct:{s['circuit_pts']:>2} | Sea:{s['season_pts']:>2}){slump}"
+            bd    = (f"(L5:{s['last5_pts']:>4} | Cct:{s['circuit_pts']:>2} | "
+                     f"Sea:{s['season_pts']:>2} | Tm:{s['team_pts']:>2}){slump}")
             print(f"  {medal}  {s['driver']:<22} {s['team']:<20} {s['score']:>6.2f}  {bd}")
 
     # ── Constructor outlook ───────────────────────────────────────────────────
@@ -775,10 +844,16 @@ def print_prediction_tables(scores, rain_forecast):
         print(f"  {medal}  {t['team']:<22} {t['score']:>6.2f}  ({drivers})")
 
     # ── Key ───────────────────────────────────────────────────────────────────
-    print(f"\n  Key: L5=last 5 races (x0.65) | Cct=circuit last yr (x0.25) | Sea=last season (x0.10)")
+    print(f"\n  Key: L5=last 5 races (recency-weighted) | Cct=circuit last yr | "
+          f"Sea=last season | Tm=team's recent form")
     print(f"  ⚠slump = 0pts in last 3+ races → 40% penalty applied to base score")
+    if weights["learned"]:
+        print(f"  Weights: learned from {weights['races_trained']} historical results "
+              f"(trained {weights['trained_at']})")
+    else:
+        print(f"  Weights: default (not yet trained — run: python train_model.py)")
     if rain_forecast:
-        print(f"  Wet boost: base x (1 + wet_score x {WET_BOOST_MAX}) | max +{int(WET_BOOST_MAX*100)}%")
+        print(f"  Wet boost: base x (1 + wet_score x {weights['wet_boost_k']:.2f})")
     print(f"  ⚠  Form model — excludes strategy, mechanical failures, luck.\n")
 
 
@@ -854,7 +929,8 @@ def predict_next_race(conn):
               f"Wind: {forecast['wind_speed']} km/h  "
               f"Rain: {forecast['precipitation_mm']}mm")
         if rain_forecast:
-            print(f"  💧 Wet boost active — up to +{int(WET_BOOST_MAX*100)}% for top wet drivers")
+            wet_boost_k = get_model_weights(conn)["wet_boost_k"]
+            print(f"  💧 Wet boost active — up to +{int(wet_boost_k*100)}% for top wet drivers")
     else:
         print(f"  ⚠  No forecast — run: python fetch_weather.py --forecast-only")
     print(f"{sep}")
@@ -866,7 +942,7 @@ def predict_next_race(conn):
         print("\n  No active drivers found. Run repair_drivers.py first.")
         return
 
-    print_prediction_tables(scores, rain_forecast)
+    print_prediction_tables(conn, scores, rain_forecast)
 
 
 def auto_lock_prediction(conn):

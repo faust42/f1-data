@@ -628,6 +628,14 @@ def main():
 
         fetch_openf1_supplement(conn)
 
+    # ── Retrain prediction model ──────────────────────────────────────────────
+    # New results just landed, so re-fit the prediction weights against the
+    # full history including them (see train_model.py — this is how the
+    # predictor "learns" after every race instead of running on stale guesses).
+    print("\n[5/5] Retraining prediction model...")
+    import train_model
+    train_model.retrain_weights(conn)
+
     # ── Final summary (both modes) ────────────────────────────────────────────
     print("\nFinal row counts:")
     for table in ["teams", "drivers", "races", "results", "seasons"]:
