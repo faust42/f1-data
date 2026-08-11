@@ -25,6 +25,7 @@ import os
 import json
 import argparse
 import difflib
+import hashlib
 from datetime import datetime, timedelta
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -122,12 +123,23 @@ def get_connection():
 
 
 def cache_key(url, params=None):
-    """Build a filesystem-safe cache filename from URL + params."""
-    key = url.replace("https://", "").replace("/", "_").replace(".", "_")
-    if params:
-        param_str = "&".join(f"{k}={v}" for k, v in sorted(params.items(), key=lambda x: str(x[0])))
-        key = f"{key}__{param_str}"
-    return os.path.join(CACHE_DIR, f"wx_{key[:180]}.json")
+    """
+    Build a filesystem-safe cache filename from URL + params.
+
+    LEARNING NOTE: We used to build this from the literal URL + query
+    string, truncated to 180 chars. That's fine on Linux, but on Windows
+    the full path (drive + every parent folder + filename) is capped at
+    260 characters by default — a long parent folder (e.g. deep inside
+    OneDrive) plus a long query string like Open-Meteo's hourly params
+    can blow past that limit and fail with a confusing FileNotFoundError.
+    Hashing the URL+params gives a short, fixed-length, always-safe
+    filename regardless of how long the real request was — and as a
+    bonus, avoids two different long URLs colliding after truncation.
+    """
+    param_str = "&".join(f"{k}={v}" for k, v in sorted((params or {}).items(), key=lambda x: str(x[0])))
+    digest    = hashlib.sha1(f"{url}?{param_str}".encode()).hexdigest()[:16]
+    slug      = "".join(c if c.isalnum() else "_" for c in url.rstrip("/").split("/")[-1])[:30]
+    return os.path.join(CACHE_DIR, f"wx_{slug}_{digest}.json")
 
 
 def fetch(url, params=None, source="API", use_cache=True):
