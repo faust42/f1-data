@@ -22,7 +22,7 @@ All API calls are cached to disk (`cache/`) so re-running a script doesn't re-hi
 | `fetch_data.py` | Fetches teams, drivers, races, results, and standings. Supports `--refresh-current` to only refresh the current season. |
 | `fetch_weather.py` | Fetches race weather (historical + forecast). Supports `--forecast-only`. |
 | `repair_drivers.py` | One-time repair pass: resets driver `active` flags and re-derives them from the most recent season each driver appears in. |
-| `explore.py` | Interactive menu for browsing the data — team profiles, comparisons, race schedule, and a simple "next race" predictor. |
+| `explore.py` | Interactive menu for browsing the data — team profiles, comparisons, race schedule, and a "next race" predictor. Supports `--lock-next-race` to lock in that prediction non-interactively (for cron). |
 
 ## Setup
 
@@ -42,7 +42,7 @@ Re-runs of `fetch_data.py` and `fetch_weather.py` are fast — cached API respon
 python explore.py
 ```
 
-Menu options: search for a team profile, view all team profiles, compare teams side by side, view the race schedule, and get a simple prediction for the next race.
+Menu options: search for a team profile, view all team profiles, compare teams side by side, view the race schedule, and get a prediction for the next race.
 
 To pull fresh data for the current season only (e.g. after a new race weekend):
 
@@ -50,6 +50,45 @@ To pull fresh data for the current season only (e.g. after a new race weekend):
 python fetch_data.py --refresh-current
 python fetch_weather.py --forecast-only
 ```
+
+### Predictions: preview vs. locked-in
+
+`predict_next_race` (menu option 5) can be run at any time and always shows a
+**live, unofficial preview** recalculated from current form — right up until
+the prediction is locked in.
+
+Predictions lock in automatically on **race morning**, once the weather
+forecast is as accurate as it's going to get, via:
+
+```bash
+python explore.py --lock-next-race
+```
+
+This is non-interactive and safe to run repeatedly (it's a no-op if it's not
+race day yet, or if today's prediction is already locked). It's meant to run
+once, automatically, race morning — see [Automation](#automation-cron) below.
+Once locked, `predict_next_race` and the race schedule (menu option 4) show
+that same official prediction alongside the actual result once the race is
+run.
+
+## Automation (cron)
+
+None of these scripts need to run as a long-lived service — they're short
+scripts that do one pass and exit, so a daily cron job is enough to keep the
+database current. Example crontab (adjust the hour so the weather/lock job
+runs comfortably before lights out on a race day, in the server's local time):
+
+```cron
+# Refresh current-season results + forecast every morning
+0 6 * * * cd /root/f1-data && python fetch_data.py --refresh-current >> refresh.log 2>&1
+5 6 * * * cd /root/f1-data && python fetch_weather.py --forecast-only >> refresh.log 2>&1
+
+# Lock in today's prediction — only fires on an actual race morning
+10 6 * * * cd /root/f1-data && python explore.py --lock-next-race >> refresh.log 2>&1
+```
+
+Since `race_date` only stores a date (no start time), pick a cron hour early
+enough to beat every race's local start time with margin.
 
 ## Database schema
 
@@ -61,6 +100,7 @@ SQLite database (`f1_data.db`, gitignored — regenerate it with the scripts abo
 - **races** — one row per Grand Prix event
 - **results** — one row per driver per race (the most granular table)
 - **race_weather** — one row per race (averaged conditions, source-tagged `openf1` / `open-meteo` / `open-meteo-forecast`)
+- **predictions** — one row per driver per race, locked in on race morning (see [Predictions](#predictions-preview-vs-locked-in) above); never overwritten once saved
 
 ## Notes
 
